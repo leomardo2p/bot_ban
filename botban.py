@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 import logging
+import re
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import ChannelParticipantsAdmins
 from langdetect import detect, LangDetectException
@@ -11,6 +12,16 @@ BOT_TOKEN = '7785664924:AAFIYaUND55b2-hHhJ0zSiM1nD02BpZj6l0'
 DB_PATH = 'bot.db'
 SUPER_ADMIN = 'Leonardo2004'
 logging.basicConfig(level=logging.INFO)
+
+
+
+# Alfabetos permitidos: Latin (incluye inglés, español, etc.), Han (chino), Hiragana/Katakana (japonés)
+ALLOWED_PATTERNS = re.compile(r'[\u0000-\u007F\u0080-\u00FF\u0100-\u017F\u0180-\u024F\u0250-\u02AF\u0300-\u036F\u0370-\u03FF\u0400-\u04FF\u0500-\u052F\u1E00-\u1EFF\u2E80-\u2FD5\u3400-\u4DBF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF]+')
+
+# Función simplificada para detectar cualquier carácter prohibido
+def contains_forbidden(text: str) -> bool:
+    # Si hay algún carácter que NO esté en los rangos permitidos → prohibido
+    return not bool(ALLOWED_PATTERNS.fullmatch(text))
 
 # === DB ===
 def init_db():
@@ -249,12 +260,59 @@ async def text_handler(event):
             await event.respond("✅ Admin quitado.", buttons=[Button.inline("🔙 Menú", b"menu")])
     states.pop(uid, None)
 
-# === Baneo en grupos ===
+# --- Función para extraer texto de cualquier media ---
+def extract_text_from_media(message) -> str:
+    text_parts = []
+    # Caption
+    if message.message:
+        text_parts.append(message.message)
+    # Título del archivo (si existe)
+    if message.media and hasattr(message.media, 'document') and message.media.document:
+        for attr in message.media.document.attributes:
+            if hasattr(attr, 'file_name'):
+                text_parts.append(attr.file_name)
+            if hasattr(attr, 'title'):
+                text_parts.append(attr.title)
+    return " ".join(text_parts)
+
+# --- Handler ÚNICO para mensajes + media ---
+@client.on(events.NewMessage(func=lambda e: e.is_group and not is_admin(e.sender_id)))
+async def ban_media(event):
+    uid = event.sender_id
+    chat_id = event.chat_id
+    texto_completo = extract_text_from_media(event.message)
+
+    # 1. Palabras prohibidas
+    for w in get_words():
+        if w.lower() in texto_completo.lower():
+            razon = f"Palabra prohibida: {w}"
+            break
+    else:
+        # 2. Idioma/caracteres prohibidos
+        if contains_forbidden(texto_completo):
+            razon = "Descripción/caracteres no latinos/chinos/japoneses"
+        else:
+            return  # todo OK
+
+    try:
+        await event.delete()
+    except Exception as e:
+        logging.warning(f"Delete error: {e}")
+
+    try:
+        await client.edit_permissions(chat_id, uid, view_messages=False)
+        user = await event.get_user()
+        await event.respond(
+            f"🚫 @{user.username} baneado.\n📄 Razón: {razon}",
+            buttons=[[Button.inline("🔄 Desbanear", f"unban_{uid}")]]
+        )
+    except Exception as e:
+        logging.warning(f"Ban error: {e}")
+
+# === Nuevo miembro ===
 @client.on(events.ChatAction)
-async def ban_logic(event):
-    if not event.is_group:
-        return
-    if not (event.user_joined or event.user_added):
+async def ban_join(event):
+    if not event.is_group or not (event.user_joined or event.user_added):
         return
     uid = event.user_id
     if is_admin(uid) or is_free(uid):
@@ -262,42 +320,11 @@ async def ban_logic(event):
     user = await event.get_user()
     nombre = f"{user.first_name or ''} {user.last_name or ''}".strip()
     if detect_lang(nombre):
+        await client.edit_permissions(event.chat_id, uid, view_messages=False)
         await event.reply(
-            f"🚫 @{user.username} baneado.\n📄 Razón: nombre ruso/hindi",
+            f"🚫 @{user.username} baneado.\n📄 Razón: Nombre no permitido.",
             buttons=[[Button.inline("🔄 Desbanear", f"unban_{uid}")]]
         )
-        await client.edit_permissions(event.chat_id, uid, view_messages=False)
-
-@client.on(events.NewMessage(func=lambda e: e.is_group and not is_admin(e.sender_id)))
-async def ban_msg(event):
-    txt = event.text or ""
-    uid = event.sender_id
-    chat_id = event.chat_id
-
-    razon = None
-    if detect_lang(txt):
-        razon = "Idioma ruso/hindi"
-    else:
-        for w in get_words():
-            if w.lower() in txt.lower():
-                razon = f"Palabra prohibida: {w}"
-                break
-
-    if razon and not is_free(uid):
-        try:
-            await event.delete()
-        except Exception as e:
-            logging.warning(f"No pude borrar: {e}")
-        try:
-            await client.edit_permissions(chat_id, uid, view_messages=False)
-            user = await event.get_user()
-            await event.respond(
-                f"🚫 @{user.username} baneado.\n📄 Razón: {razon}",
-                buttons=[[Button.inline("🔄 Desbanear", f"unban_{uid}")]]
-            )
-        except Exception as e:
-            logging.warning(f"No pude banear: {e}")
-
 # === Desbanear callback ===
 @client.on(events.CallbackQuery())
 async def unban_cb(event):
